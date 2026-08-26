@@ -1,0 +1,195 @@
+name: Build GameShelf iPhone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gameshelf-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select Xcode 26 with iOS platform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          candidates=(
+            "/Applications/Xcode_26.5.app"
+            "/Applications/Xcode_26.5.0.app"
+            "/Applications/Xcode_26.4.1.app"
+            "/Applications/Xcode_26.4.app"
+            "/Applications/Xcode_26.2.app"
+            "/Applications/Xcode.app"
+          )
+
+          selected=""
+          for candidate in "${candidates[@]}"; do
+            if [[ -d "$candidate" ]]; then
+              selected="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$selected" ]]; then
+            selected="$(find /Applications -maxdepth 1 -type d -name 'Xcode_26*.app' -print | sort -V | tail -n 1 || true)"
+          fi
+
+          if [[ -z "$selected" || ! -d "$selected" ]]; then
+            echo "No se encontró Xcode 26 en el runner macOS." >&2
+            exit 1
+          fi
+
+          echo "Seleccionando: $selected"
+          sudo xcode-select -s "$selected/Contents/Developer"
+          sudo xcodebuild -runFirstLaunch
+
+          xcode_version="$(xcodebuild -version)"
+          echo "$xcode_version"
+          echo "SDK iPhoneOS: $(xcrun --sdk iphoneos --show-sdk-version)"
+          if ! grep -Eq '^Xcode 26\.' <<< "$xcode_version"; then
+            echo "Se esperaba Xcode 26.x." >&2
+            exit 1
+          fi
+
+      - name: Ensure iOS platform is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_destinations() {
+            xcodebuild -project GameShelf.xcodeproj -scheme GameShelf -showdestinations 2>&1 || true
+          }
+
+          destinations="$(check_destinations)"
+          echo "$destinations"
+
+          if grep -Eq 'iOS [0-9.]+ is not installed' <<< "$destinations"; then
+            echo "Instalando la plataforma iOS requerida..."
+            arch="$(uname -m)"
+            if [[ "$arch" == "arm64" ]]; then variant="arm64"; else variant="universal"; fi
+            xcodebuild -downloadPlatform iOS -architectureVariant "$variant"
+            destinations="$(check_destinations)"
+            echo "$destinations"
+          fi
+
+          if ! grep -q 'Any iOS Device' <<< "$destinations"; then
+            echo "No aparece el destino genérico 'Any iOS Device'." >&2
+            exit 1
+          fi
+
+      - name: Validate project
+        shell: bash
+        run: |
+          set -euo pipefail
+          plutil -lint GameShelf/Info.plist
+          plutil -lint GameShelf.xcodeproj/project.pbxproj
+          xcodebuild -project GameShelf.xcodeproj -list
+          xcodebuild -project GameShelf.xcodeproj -scheme GameShelf -configuration Release -showBuildSettings > /tmp/gameshelf-build-settings.txt
+          grep -E 'PRODUCT_BUNDLE_IDENTIFIER|IPHONEOS_DEPLOYMENT_TARGET|SWIFT_VERSION|SWIFT_COMPILATION_MODE' /tmp/gameshelf-build-settings.txt || true
+
+      - name: Build for iPhone without signing
+        id: xcodebuild
+        shell: bash
+        run: |
+          set -uo pipefail
+          rm -rf build
+          mkdir -p build
+
+          set +e
+          xcodebuild \
+            -project GameShelf.xcodeproj \
+            -scheme GameShelf \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            -resultBundlePath "$PWD/build/GameShelf.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            clean build 2>&1 | tee build/xcodebuild.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $status -ne 0 ]]; then
+            echo
+            echo "============================================================"
+            echo " ERRORES REALES DE XCODE"
+            echo "============================================================"
+            grep -nE '(^|[[:space:]])(error:|fatal error:)|Command .* failed|SwiftCompile|CompileSwift' build/xcodebuild.log | tail -n 120 || true
+            echo
+            echo "================ ÚLTIMAS 160 LÍNEAS ========================"
+            tail -n 160 build/xcodebuild.log || true
+            exit "$status"
+          fi
+
+      - name: Upload build diagnostics on failure
+        if: failure() && steps.xcodebuild.outcome == 'failure'
+        uses: actions/upload-artifact@v5
+        with:
+          name: GameShelf-build-diagnostics
+          path: |
+            build/xcodebuild.log
+            build/GameShelf.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "$PWD/build/DerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name 'GameShelf.app' -print -quit)"
+          if [[ -z "$APP_PATH" || ! -d "$APP_PATH" ]]; then
+            echo "No se encontró GameShelf.app tras la compilación." >&2
+            exit 1
+          fi
+          if [[ ! -f "$APP_PATH/GameShelf" ]]; then
+            echo "GameShelf.app no contiene el ejecutable esperado." >&2
+            exit 1
+          fi
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/GameShelf.app
+          xattr -cr build/ipa/Payload/GameShelf.app || true
+
+          (
+            cd build/ipa
+            /usr/bin/zip -qry ../GameShelf-iPhone.ipa Payload
+          )
+
+          unzip -t build/GameShelf-iPhone.ipa
+          shasum -a 256 build/GameShelf-iPhone.ipa | tee build/GameShelf-iPhone.ipa.sha256
+
+          echo "### GameShelf IPA generado" >> "$GITHUB_STEP_SUMMARY"
+          echo "Descarga el artefacto **GameShelf-iPhone**." >> "$GITHUB_STEP_SUMMARY"
+          echo "El IPA está sin firmar para que AltStore lo firme durante la instalación." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v5
+        with:
+          name: GameShelf-iPhone
+          path: |
+            build/GameShelf-iPhone.ipa
+            build/GameShelf-iPhone.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
